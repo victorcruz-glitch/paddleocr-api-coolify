@@ -11,17 +11,18 @@ app = FastAPI(title="PaddleOCR API - CPU Multi-Model")
 # --- Instancia os DOIS modelos na memória na hora que a API sobe ---
 
 # 1. Modelo Mobile (Leve e rápido)
-print("Carregando modelo Mobile...")
-ocr_mobile = PaddleOCR(use_angle_cls=True, lang="pt")
+print("Carregando modelo Mobile (v5)...")
+ocr_mobile = PaddleOCR(use_angle_cls=True, lang="pt", ocr_version="PP-OCRv4")
 
 # 2. Modelo Server (Pesado e preciso)
-print("Carregando modelo Server...")
+print("Carregando modelo Server (v5)...")
 ocr_server = PaddleOCR(
     use_angle_cls=True, 
     lang="pt",
+    ocr_version="PP-OCRv4", # Força a pipeline V5 por debaixo dos panos 
     det_algorithm="DB",
-    rec_algorithm="SVTR_LCNet", # Força arquitetura server v4/v5
-    det_limit_side_len=1280     # Lê imagens maiores sem redimensionar tanto (mais precisão)
+    rec_algorithm="SVTR_LCNet", 
+    det_limit_side_len=1280
 )
 
 class OCRResponse(BaseModel):
@@ -34,13 +35,52 @@ class OCRResponse(BaseModel):
 
 class ImagePayload(BaseModel):
     image_base64: str
-    model: str = "mobile" # Valor default (mobile ou server)
+    model: str # Obrigatório (mobile ou server)
+    preprocess: bool = False # Valor default (desativado por segurança)
 
-def process_image(img_array, model_type="mobile"):
+def preprocess_for_ocr(img_array):
     """
-    Função base para processar a imagem. Escolhe o modelo baseado no parâmetro.
+    Tratamento de imagem agressivo para melhorar leitura de PDFs escaneados e fotos ruins
+    """
+    try:
+        # 1. Converte para escala de cinza (remove cores inúteis)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        
+        # 2. Aumenta o contraste usando CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        # Isso faz os textos pretos ficarem mais pretos sem estourar o fundo branco
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        contrast = clahe.apply(gray)
+        
+        # 3. Suavização muito leve para remover ruído JPEG antes da binarização
+        blur = cv2.GaussianBlur(contrast, (3, 3), 0)
+        
+        # 4. Binarização adaptativa: transforma a imagem estritamente em Preto(texto) e Branco(fundo)
+        # Essencial para apagar manchas de sombra na foto ou texturas de mesa
+        binary = cv2.adaptiveThreshold(
+            blur, 255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            11, 2
+        )
+        
+        # Converte de volta para 3 canais (RGB) porque o PaddleOCR espera esse formato na entrada
+        final_img = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+        return final_img
+    except Exception as e:
+        print(f"Erro no pré-processamento: {e}")
+        return img_array # Em caso de erro com alguma imagem maluca, devolve a original
+
+def process_image(img_array, model_type="mobile", apply_preprocess=True):
+    """
+    Função base para processar a imagem.
     """
     start_time = time.time()
+    
+    # Aplica o filtro de limpeza visual se solicitado
+    if apply_preprocess:
+        img_to_ocr = preprocess_for_ocr(img_array)
+    else:
+        img_to_ocr = img_array
     
     # Seleciona o motor de inferência
     if model_type.lower() == "server":
@@ -50,8 +90,8 @@ def process_image(img_array, model_type="mobile"):
         engine = ocr_mobile
         used = "mobile"
     
-    # O PaddleOCR espera uma imagem em formato numpy RGB (OpenCV)
-    result = engine.ocr(img_array)
+    # Roda o OCR na imagem tratada
+    result = engine.ocr(img_to_ocr)
     
     processing_time = (time.time() - start_time) * 1000
     
@@ -114,7 +154,7 @@ async def ocr_base64(payload: ImagePayload):
         if img_cv2 is None:
              raise ValueError("Falha ao decodificar imagem. Verifique se o base64 está correto.")
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, payload.model)
+        data, full_text_str, proc_time, used = process_image(img_cv2, payload.model, payload.preprocess)
         
         return OCRResponse(
             success=True, 
@@ -135,7 +175,11 @@ async def ocr_base64(payload: ImagePayload):
         )
 
 @app.post("/predict/file", response_model=OCRResponse)
-async def ocr_file(file: UploadFile = File(...), model: str = Query("mobile", description="Escolha 'mobile' ou 'server'")):
+async def ocr_file(
+    file: UploadFile = File(...), 
+    model: str = Query(..., description="Obrigatório: Escolha 'mobile' ou 'server'"),
+    preprocess: bool = Query(False, description="Opcional: Ativar pré-processamento de imagem")
+):
     try:
         contents = await file.read()
         np_arr = np.frombuffer(contents, np.uint8)
@@ -144,7 +188,7 @@ async def ocr_file(file: UploadFile = File(...), model: str = Query("mobile", de
         if img_cv2 is None:
              raise ValueError("Falha ao processar arquivo.")
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, model)
+        data, full_text_str, proc_time, used = process_image(img_cv2, model, preprocess)
         
         return OCRResponse(
             success=True, 
