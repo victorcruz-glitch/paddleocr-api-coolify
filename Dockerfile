@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir "paddleocr==2.8.1"
 # Instala FastAPI e Uvicorn para o servidor REST
 RUN pip install --no-cache-dir fastapi uvicorn python-multipart pydantic numpy
 
+# Baixa o modelo FSRCNN de Super Resolução (Apenas 40 KB!)
+RUN wget -q https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x4.pb -O /app/FSRCNN_x4.pb
+
 # Copia o código da nossa API
 COPY api.py /app/api.py
 

@@ -8,7 +8,17 @@ import time
 
 app = FastAPI(title="PaddleOCR API - CPU Multi-Model")
 
-# --- Instancia os DOIS modelos na memória na hora que a API sobe ---
+# Se a opção upscale for ativada (apenas para o endpoint /predict/file por enquanto)
+from cv2 import dnn_superres
+try:
+    print("Carregando modelo de Upscale (FSRCNN)...")
+    sr = dnn_superres.DnnSuperResImpl_create()
+    sr.readModel('/app/FSRCNN_x4.pb')
+    sr.setModel('fsrcnn', 4)
+    has_upscaler = True
+except Exception as e:
+    print(f"Erro ao carregar upscaler: {e}")
+    has_upscaler = False
 
 # 1. Modelo Mobile (Leve e rápido)
 print("Carregando modelo Mobile (v5)...")
@@ -65,17 +75,24 @@ def preprocess_for_ocr(img_array):
         print(f"Erro no pré-processamento: {e}")
         return img_array
 
-def process_image(img_array, model_type="mobile", apply_preprocess=True):
+def process_image(img_array, model_type="mobile", apply_preprocess=True, apply_upscale=False):
     """
     Função base para processar a imagem.
     """
     start_time = time.time()
     
-    # Aplica o filtro de limpeza visual se solicitado
+    # Aplica IA de Super Resolução (Upscale 4x) se solicitado e disponível
+    img_to_ocr = img_array
+    if apply_upscale and has_upscaler:
+        try:
+            print("Aplicando AI Upscale FSRCNN...")
+            img_to_ocr = sr.upsample(img_to_ocr)
+        except Exception as e:
+            print(f"Erro no Upscale: {e}")
+            
+    # Aplica o filtro de limpeza visual clássico se solicitado
     if apply_preprocess:
-        img_to_ocr = preprocess_for_ocr(img_array)
-    else:
-        img_to_ocr = img_array
+        img_to_ocr = preprocess_for_ocr(img_to_ocr)
     
     # Seleciona o motor de inferência
     if model_type.lower() == "server":
@@ -173,7 +190,8 @@ async def ocr_base64(payload: ImagePayload):
 async def ocr_file(
     file: UploadFile = File(...), 
     model: str = Query(..., description="Obrigatório: Escolha 'mobile' ou 'server'"),
-    preprocess: str = Query("false", description="Opcional: 'true' ou 'false'")
+    preprocess: str = Query("false", description="Opcional: 'true' ou 'false'"),
+    upscale: str = Query("false", description="Opcional: Ativa IA Super Resolução 4x (Aumenta o tempo de processamento)")
 ):
     try:
         contents = await file.read()
@@ -185,8 +203,9 @@ async def ocr_file(
              
         # Converte string explícita para boolean
         do_preprocess = preprocess.lower() == "true"
+        do_upscale = upscale.lower() == "true"
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, model, do_preprocess)
+        data, full_text_str, proc_time, used = process_image(img_cv2, model, do_preprocess, do_upscale)
         
         return OCRResponse(
             success=True, 
