@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from pydantic import BaseModel
 import numpy as np
 import cv2
@@ -6,33 +6,52 @@ from paddleocr import PaddleOCR
 import base64
 import time
 
-app = FastAPI(title="PaddleOCR API - CPU Lightweight Version")
+app = FastAPI(title="PaddleOCR API - CPU Multi-Model")
 
-# Inicializa o PaddleOCR usando o modelo "Mobile" (Tiny)
-# lang="pt" -> Suporte a português, mas mantendo suporte geral a inglês tb
-# use_angle_cls=True -> Ajusta a rotação automática de textos
-# show_log=False -> Diminui os logs que pesam
-# use_gpu=False -> Como vc quer ir só de CPU
-ocr = PaddleOCR(use_angle_cls=True, lang="pt")
+# --- Instancia os DOIS modelos na memória na hora que a API sobe ---
+
+# 1. Modelo Mobile (Leve e rápido)
+print("Carregando modelo Mobile...")
+ocr_mobile = PaddleOCR(use_angle_cls=True, lang="pt")
+
+# 2. Modelo Server (Pesado e preciso)
+print("Carregando modelo Server...")
+ocr_server = PaddleOCR(
+    use_angle_cls=True, 
+    lang="pt",
+    det_algorithm="DB",
+    rec_algorithm="SVTR_LCNet", # Força arquitetura server v4/v5
+    det_limit_side_len=1280     # Lê imagens maiores sem redimensionar tanto (mais precisão)
+)
 
 class OCRResponse(BaseModel):
     success: bool
     processing_time_ms: float
+    model_used: str
     data: list
     full_text: str = ""
     message: str = ""
 
 class ImagePayload(BaseModel):
     image_base64: str
+    model: str = "mobile" # Valor default (mobile ou server)
 
-def process_image(img_array):
+def process_image(img_array, model_type="mobile"):
     """
-    Função base para processar a imagem (numpy array) no PaddleOCR
+    Função base para processar a imagem. Escolhe o modelo baseado no parâmetro.
     """
     start_time = time.time()
     
+    # Seleciona o motor de inferência
+    if model_type.lower() == "server":
+        engine = ocr_server
+        used = "server"
+    else:
+        engine = ocr_mobile
+        used = "mobile"
+    
     # O PaddleOCR espera uma imagem em formato numpy RGB (OpenCV)
-    result = ocr.ocr(img_array)
+    result = engine.ocr(img_array)
     
     processing_time = (time.time() - start_time) * 1000
     
@@ -56,8 +75,6 @@ def process_image(img_array):
     full_text = ""
     if extracted_data:
         # 1. Ordena os blocos de texto usando a coordenada Y inicial do box (para ler de cima para baixo)
-        # O box é uma lista de 4 pontos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
-        # O Ponto Top-Left é box[0], e a coordenada Y desse ponto é box[0][1]
         sorted_data = sorted(extracted_data, key=lambda x: x['box'][0][1])
         
         lines = []
@@ -84,7 +101,7 @@ def process_image(img_array):
             
         full_text = "\n".join(lines)
                 
-    return extracted_data, full_text, processing_time
+    return extracted_data, full_text, processing_time, used
 
 @app.post("/predict/base64", response_model=OCRResponse)
 async def ocr_base64(payload: ImagePayload):
@@ -97,11 +114,12 @@ async def ocr_base64(payload: ImagePayload):
         if img_cv2 is None:
              raise ValueError("Falha ao decodificar imagem. Verifique se o base64 está correto.")
 
-        data, full_text_str, proc_time = process_image(img_cv2)
+        data, full_text_str, proc_time, used = process_image(img_cv2, payload.model)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
+            model_used=used,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -111,12 +129,13 @@ async def ocr_base64(payload: ImagePayload):
         return OCRResponse(
             success=False, 
             processing_time_ms=0,
+            model_used="",
             data=[],
             message=str(e)
         )
 
 @app.post("/predict/file", response_model=OCRResponse)
-async def ocr_file(file: UploadFile = File(...)):
+async def ocr_file(file: UploadFile = File(...), model: str = Query("mobile", description="Escolha 'mobile' ou 'server'")):
     try:
         contents = await file.read()
         np_arr = np.frombuffer(contents, np.uint8)
@@ -125,11 +144,12 @@ async def ocr_file(file: UploadFile = File(...)):
         if img_cv2 is None:
              raise ValueError("Falha ao processar arquivo.")
 
-        data, full_text_str, proc_time = process_image(img_cv2)
+        data, full_text_str, proc_time, used = process_image(img_cv2, model)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
+            model_used=used,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -139,6 +159,7 @@ async def ocr_file(file: UploadFile = File(...)):
         return OCRResponse(
             success=False, 
             processing_time_ms=0,
+            model_used="",
             data=[],
             message=str(e)
         )
