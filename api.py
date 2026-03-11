@@ -19,6 +19,7 @@ class OCRResponse(BaseModel):
     success: bool
     processing_time_ms: float
     data: list
+    full_text: str = ""
     message: str = ""
 
 class ImagePayload(BaseModel):
@@ -51,7 +52,39 @@ def process_image(img_array):
                     "confidence": float(confidence)
                 })
                 
-    return extracted_data, processing_time
+    # --- Lógica para formatar o full_text inteligentemente ---
+    full_text = ""
+    if extracted_data:
+        # 1. Ordena os blocos de texto usando a coordenada Y inicial do box (para ler de cima para baixo)
+        # O box é uma lista de 4 pontos: [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
+        # O Ponto Top-Left é box[0], e a coordenada Y desse ponto é box[0][1]
+        sorted_data = sorted(extracted_data, key=lambda x: x['box'][0][1])
+        
+        lines = []
+        current_line = []
+        # Agrupa textos que estão na mesma "linha" horizontal (com margem de erro Y de 10 pixels)
+        last_y = sorted_data[0]['box'][0][1]
+        
+        for item in sorted_data:
+            current_y = item['box'][0][1]
+            # Se a diferença Y for menor que 15 pixels, consideramos a mesma linha
+            if abs(current_y - last_y) < 15:
+                current_line.append(item)
+            else:
+                # Ordena a linha atual da esquerda para a direita (X inicial: box[0][0])
+                current_line.sort(key=lambda x: x['box'][0][0])
+                lines.append(" ".join([i['text'] for i in current_line]))
+                current_line = [item]
+                last_y = current_y
+                
+        # Adiciona a última linha
+        if current_line:
+            current_line.sort(key=lambda x: x['box'][0][0])
+            lines.append(" ".join([i['text'] for i in current_line]))
+            
+        full_text = "\n".join(lines)
+                
+    return extracted_data, full_text, processing_time
 
 @app.post("/predict/base64", response_model=OCRResponse)
 async def ocr_base64(payload: ImagePayload):
@@ -64,12 +97,13 @@ async def ocr_base64(payload: ImagePayload):
         if img_cv2 is None:
              raise ValueError("Falha ao decodificar imagem. Verifique se o base64 está correto.")
 
-        data, proc_time = process_image(img_cv2)
+        data, full_text_str, proc_time = process_image(img_cv2)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
             data=data,
+            full_text=full_text_str,
             message="Sucesso"
         )
         
@@ -91,12 +125,13 @@ async def ocr_file(file: UploadFile = File(...)):
         if img_cv2 is None:
              raise ValueError("Falha ao processar arquivo.")
 
-        data, proc_time = process_image(img_cv2)
+        data, full_text_str, proc_time = process_image(img_cv2)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
             data=data,
+            full_text=full_text_str,
             message="Sucesso"
         )
         
