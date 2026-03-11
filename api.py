@@ -11,10 +11,17 @@ app = FastAPI(title="PaddleOCR API - CPU Multi-Model")
 # Se a opção upscale for ativada (apenas para o endpoint /predict/file por enquanto)
 from cv2 import dnn_superres
 try:
-    print("Carregando modelo de Upscale (FSRCNN)...")
-    sr = dnn_superres.DnnSuperResImpl_create()
-    sr.readModel('/app/FSRCNN_x4.pb')
-    sr.setModel('fsrcnn', 4)
+    print("Carregando modelos de Upscale (FSRCNN 2x e 4x)...")
+    # Carrega modelo 2x
+    sr_x2 = dnn_superres.DnnSuperResImpl_create()
+    sr_x2.readModel('/app/FSRCNN_x2.pb')
+    sr_x2.setModel('fsrcnn', 2)
+    
+    # Carrega modelo 4x
+    sr_x4 = dnn_superres.DnnSuperResImpl_create()
+    sr_x4.readModel('/app/FSRCNN_x4.pb')
+    sr_x4.setModel('fsrcnn', 4)
+    
     has_upscaler = True
 except Exception as e:
     print(f"Erro ao carregar upscaler: {e}")
@@ -39,6 +46,8 @@ class OCRResponse(BaseModel):
     success: bool
     processing_time_ms: float
     model_used: str
+    preprocess_applied: bool
+    upscale_applied: bool
     data: list
     full_text: str = ""
     message: str = ""
@@ -46,7 +55,8 @@ class OCRResponse(BaseModel):
 class ImagePayload(BaseModel):
     image_base64: str
     model: str # Obrigatório (mobile ou server)
-    preprocess: bool = False # Valor default (desativado por segurança)
+    preprocess: bool = False # Valor default
+    upscale: int = 0 # Valor default 0 (desativado). Opções: 2 ou 4
 
 def preprocess_for_ocr(img_array):
     """
@@ -75,24 +85,37 @@ def preprocess_for_ocr(img_array):
         print(f"Erro no pré-processamento: {e}")
         return img_array
 
-def process_image(img_array, model_type="mobile", apply_preprocess=True, apply_upscale=False):
+def process_image(img_array, model_type="mobile", apply_preprocess=True, upscale_multiplier=0):
     """
     Função base para processar a imagem.
     """
     start_time = time.time()
     
-    # Aplica IA de Super Resolução (Upscale 4x) se solicitado e disponível
+    upscale_status = False
+    preprocess_status = False
+    
+    # Aplica IA de Super Resolução se solicitado e disponível (2x ou 4x)
     img_to_ocr = img_array
-    if apply_upscale and has_upscaler:
+    if upscale_multiplier > 0 and has_upscaler:
         try:
-            print("Aplicando AI Upscale FSRCNN...")
-            img_to_ocr = sr.upsample(img_to_ocr)
+            if upscale_multiplier <= 2:
+                print("Aplicando AI Upscale FSRCNN 2x...")
+                img_to_ocr = sr_x2.upsample(img_to_ocr)
+                upscale_status = True
+            else:
+                print("Aplicando AI Upscale FSRCNN 4x...")
+                img_to_ocr = sr_x4.upsample(img_to_ocr)
+                upscale_status = True
         except Exception as e:
             print(f"Erro no Upscale: {e}")
             
     # Aplica o filtro de limpeza visual clássico se solicitado
     if apply_preprocess:
-        img_to_ocr = preprocess_for_ocr(img_to_ocr)
+        try:
+            img_to_ocr = preprocess_for_ocr(img_to_ocr)
+            preprocess_status = True
+        except Exception as e:
+            print(f"Erro preprocess: {e}")
     
     # Seleciona o motor de inferência
     if model_type.lower() == "server":
@@ -153,7 +176,7 @@ def process_image(img_array, model_type="mobile", apply_preprocess=True, apply_u
             
         full_text = "\n".join(lines)
                 
-    return extracted_data, full_text, processing_time, used
+    return extracted_data, full_text, processing_time, used, preprocess_status, upscale_status
 
 @app.post("/predict/base64", response_model=OCRResponse)
 async def ocr_base64(payload: ImagePayload):
@@ -166,12 +189,14 @@ async def ocr_base64(payload: ImagePayload):
         if img_cv2 is None:
              raise ValueError("Falha ao decodificar imagem. Verifique se o base64 está correto.")
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, payload.model, payload.preprocess)
+        data, full_text_str, proc_time, used, prep_status, up_status = process_image(img_cv2, payload.model, payload.preprocess, payload.upscale)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
             model_used=used,
+            preprocess_applied=prep_status,
+            upscale_applied=up_status,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -182,6 +207,8 @@ async def ocr_base64(payload: ImagePayload):
             success=False, 
             processing_time_ms=0,
             model_used="",
+            preprocess_applied=False,
+            upscale_applied=False,
             data=[],
             message=str(e)
         )
@@ -191,7 +218,7 @@ async def ocr_file(
     file: UploadFile = File(...), 
     model: str = Query(..., description="Obrigatório: Escolha 'mobile' ou 'server'"),
     preprocess: str = Query("false", description="Opcional: 'true' ou 'false'"),
-    upscale: str = Query("false", description="Opcional: Ativa IA Super Resolução 4x (Aumenta o tempo de processamento)")
+    upscale: int = Query(0, description="Opcional: Multiplicador de Upscale. Escolha 0 (Desligado), 2 ou 4")
 ):
     try:
         contents = await file.read()
@@ -203,14 +230,18 @@ async def ocr_file(
              
         # Converte string explícita para boolean
         do_preprocess = preprocess.lower() == "true"
-        do_upscale = upscale.lower() == "true"
+        
+        # O upscale já vem como int pelo FastAPI devido à tipagem
+        upscale_val = upscale
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, model, do_preprocess, do_upscale)
+        data, full_text_str, proc_time, used, prep_status, up_status = process_image(img_cv2, model, do_preprocess, upscale_val)
         
         return OCRResponse(
             success=True, 
             processing_time_ms=proc_time,
             model_used=used,
+            preprocess_applied=prep_status,
+            upscale_applied=up_status,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -221,6 +252,8 @@ async def ocr_file(
             success=False, 
             processing_time_ms=0,
             model_used="",
+            preprocess_applied=False,
+            upscale_applied=False,
             data=[],
             message=str(e)
         )
