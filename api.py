@@ -48,6 +48,7 @@ class OCRResponse(BaseModel):
     model_used: str
     preprocess_applied: bool
     upscale_applied: bool
+    strategy_used: str
     data: list
     full_text: str = ""
     message: str = ""
@@ -57,6 +58,7 @@ class ImagePayload(BaseModel):
     model: str # Obrigatório (mobile ou server)
     preprocess: bool = False # Valor default
     upscale: int = 0 # Valor default 0 (desativado). Opções: 2 ou 4
+    strategy: str # Obrigatório: whole ou quadrants
 
 def preprocess_for_ocr(img_array):
     """
@@ -85,7 +87,82 @@ def preprocess_for_ocr(img_array):
         print(f"Erro no pré-processamento: {e}")
         return img_array
 
-def process_image(img_array, model_type="mobile", apply_preprocess=True, upscale_multiplier=0):
+def run_ocr(engine, img_array):
+    return engine.ocr(img_array)
+
+def extract_result(result):
+    extracted_data = []
+    if result and result[0] is not None:
+        for idx in range(len(result)):
+            res = result[idx]
+            for line in res:
+                extracted_data.append({
+                    "box": line[0],
+                    "text": line[1][0],
+                    "confidence": float(line[1][1])
+                })
+    return extracted_data
+
+def shift_box(box, offset_x, offset_y):
+    shifted = []
+    for point in box:
+        shifted.append([point[0] + offset_x, point[1] + offset_y])
+    return shifted
+
+def dedupe_data(items):
+    deduped = []
+    seen = set()
+    for item in items:
+        text = item["text"].strip().lower()
+        x = int(item["box"][0][0] / 10)
+        y = int(item["box"][0][1] / 10)
+        key = (text, x, y)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+def format_full_text(extracted_data):
+    full_text = ""
+    if extracted_data:
+        sorted_data = sorted(extracted_data, key=lambda x: x['box'][0][1])
+        lines = []
+        current_line = []
+        last_y = sorted_data[0]['box'][0][1]
+        for item in sorted_data:
+            current_y = item['box'][0][1]
+            if abs(current_y - last_y) < 15:
+                current_line.append(item)
+            else:
+                current_line.sort(key=lambda x: x['box'][0][0])
+                lines.append(" ".join([i['text'] for i in current_line]))
+                current_line = [item]
+                last_y = current_y
+        if current_line:
+            current_line.sort(key=lambda x: x['box'][0][0])
+            lines.append(" ".join([i['text'] for i in current_line]))
+        full_text = "\n".join(lines)
+    return full_text
+
+def split_quadrants(img_array, overlap_ratio=0.12):
+    h, w = img_array.shape[:2]
+    overlap_x = int(w * overlap_ratio)
+    overlap_y = int(h * overlap_ratio)
+    mid_x = w // 2
+    mid_y = h // 2
+    regions = [
+        (0, 0, min(w, mid_x + overlap_x), min(h, mid_y + overlap_y)),
+        (max(0, mid_x - overlap_x), 0, w, min(h, mid_y + overlap_y)),
+        (0, max(0, mid_y - overlap_y), min(w, mid_x + overlap_x), h),
+        (max(0, mid_x - overlap_x), max(0, mid_y - overlap_y), w, h),
+    ]
+    tiles = []
+    for x1, y1, x2, y2 in regions:
+        tiles.append((img_array[y1:y2, x1:x2], x1, y1))
+    return tiles
+
+def process_image(img_array, model_type="mobile", apply_preprocess=True, upscale_multiplier=0, strategy="whole"):
     """
     Função base para processar a imagem.
     """
@@ -124,59 +201,30 @@ def process_image(img_array, model_type="mobile", apply_preprocess=True, upscale
     else:
         engine = ocr_mobile
         used = "mobile"
-    
-    # Roda o OCR na imagem tratada
-    result = engine.ocr(img_to_ocr)
+
+    strategy_used = strategy.lower()
+    if strategy_used not in ("whole", "quadrants"):
+        raise ValueError("strategy deve ser 'whole' ou 'quadrants'")
+
+    if strategy_used == "whole":
+        result = run_ocr(engine, img_to_ocr)
+        extracted_data = extract_result(result)
+    else:
+        extracted_data = []
+        whole_result = run_ocr(engine, img_to_ocr)
+        extracted_data.extend(extract_result(whole_result))
+        for tile, offset_x, offset_y in split_quadrants(img_to_ocr):
+            tile_result = run_ocr(engine, tile)
+            tile_data = extract_result(tile_result)
+            for item in tile_data:
+                item["box"] = shift_box(item["box"], offset_x, offset_y)
+                extracted_data.append(item)
+        extracted_data = dedupe_data(extracted_data)
     
     processing_time = (time.time() - start_time) * 1000
-    
-    extracted_data = []
-    
-    if result and result[0] is not None:
-        for idx in range(len(result)):
-            res = result[idx]
-            for line in res:
-                box = line[0]  # Coordenadas da bounding box
-                text = line[1][0] # O Texto extraído em si
-                confidence = line[1][1] # Nível de confiança (0 a 1)
-                
-                extracted_data.append({
-                    "box": box,
-                    "text": text,
-                    "confidence": float(confidence)
-                })
-                
-    # --- Lógica para formatar o full_text inteligentemente ---
-    full_text = ""
-    if extracted_data:
-        # 1. Ordena os blocos de texto usando a coordenada Y inicial do box (para ler de cima para baixo)
-        sorted_data = sorted(extracted_data, key=lambda x: x['box'][0][1])
-        
-        lines = []
-        current_line = []
-        # Agrupa textos que estão na mesma "linha" horizontal (com margem de erro Y de 10 pixels)
-        last_y = sorted_data[0]['box'][0][1]
-        
-        for item in sorted_data:
-            current_y = item['box'][0][1]
-            # Se a diferença Y for menor que 15 pixels, consideramos a mesma linha
-            if abs(current_y - last_y) < 15:
-                current_line.append(item)
-            else:
-                # Ordena a linha atual da esquerda para a direita (X inicial: box[0][0])
-                current_line.sort(key=lambda x: x['box'][0][0])
-                lines.append(" ".join([i['text'] for i in current_line]))
-                current_line = [item]
-                last_y = current_y
-                
-        # Adiciona a última linha
-        if current_line:
-            current_line.sort(key=lambda x: x['box'][0][0])
-            lines.append(" ".join([i['text'] for i in current_line]))
-            
-        full_text = "\n".join(lines)
-                
-    return extracted_data, full_text, processing_time, used, preprocess_status, upscale_status
+
+    full_text = format_full_text(extracted_data)
+    return extracted_data, full_text, processing_time, used, preprocess_status, upscale_status, strategy_used
 
 @app.post("/predict/base64", response_model=OCRResponse)
 async def ocr_base64(payload: ImagePayload):
@@ -189,7 +237,7 @@ async def ocr_base64(payload: ImagePayload):
         if img_cv2 is None:
              raise ValueError("Falha ao decodificar imagem. Verifique se o base64 está correto.")
 
-        data, full_text_str, proc_time, used, prep_status, up_status = process_image(img_cv2, payload.model, payload.preprocess, payload.upscale)
+        data, full_text_str, proc_time, used, prep_status, up_status, strategy_used = process_image(img_cv2, payload.model, payload.preprocess, payload.upscale, payload.strategy)
         
         return OCRResponse(
             success=True, 
@@ -197,6 +245,7 @@ async def ocr_base64(payload: ImagePayload):
             model_used=used,
             preprocess_applied=prep_status,
             upscale_applied=up_status,
+            strategy_used=strategy_used,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -209,6 +258,7 @@ async def ocr_base64(payload: ImagePayload):
             model_used="",
             preprocess_applied=False,
             upscale_applied=False,
+            strategy_used="",
             data=[],
             message=str(e)
         )
@@ -217,6 +267,7 @@ async def ocr_base64(payload: ImagePayload):
 async def ocr_file(
     file: UploadFile = File(...), 
     model: str = Query(..., description="Obrigatório: Escolha 'mobile' ou 'server'"),
+    strategy: str = Query(..., description="Obrigatório: 'whole' ou 'quadrants'"),
     preprocess: str = Query("false", description="Opcional: 'true' ou 'false'"),
     upscale: int = Query(0, description="Opcional: Multiplicador de Upscale. Escolha 0 (Desligado), 2 ou 4")
 ):
@@ -234,7 +285,7 @@ async def ocr_file(
         # O upscale já vem como int pelo FastAPI devido à tipagem
         upscale_val = upscale
 
-        data, full_text_str, proc_time, used, prep_status, up_status = process_image(img_cv2, model, do_preprocess, upscale_val)
+        data, full_text_str, proc_time, used, prep_status, up_status, strategy_used = process_image(img_cv2, model, do_preprocess, upscale_val, strategy)
         
         return OCRResponse(
             success=True, 
@@ -242,6 +293,7 @@ async def ocr_file(
             model_used=used,
             preprocess_applied=prep_status,
             upscale_applied=up_status,
+            strategy_used=strategy_used,
             data=data,
             full_text=full_text_str,
             message="Sucesso"
@@ -254,6 +306,7 @@ async def ocr_file(
             model_used="",
             preprocess_applied=False,
             upscale_applied=False,
+            strategy_used="",
             data=[],
             message=str(e)
         )
