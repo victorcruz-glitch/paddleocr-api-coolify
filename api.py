@@ -40,35 +40,30 @@ class ImagePayload(BaseModel):
 
 def preprocess_for_ocr(img_array):
     """
-    Tratamento de imagem agressivo para melhorar leitura de PDFs escaneados e fotos ruins
+    Tratamento de imagem suave: Apenas converte para escala de cinza, 
+    aumenta o contraste linearmente (para fotos apagadas) e aplica um sharpening.
+    Ideal para não destruir imagens digitais, mas ajudar fotos ruins.
     """
     try:
-        # 1. Converte para escala de cinza (remove cores inúteis)
+        # 1. Converte para escala de cinza (remove cores distrativas como fundos vermelhos ou azuis)
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
         
-        # 2. Aumenta o contraste usando CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        # Isso faz os textos pretos ficarem mais pretos sem estourar o fundo branco
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        # 2. Aumento de Contraste Linear com clipping de histograma (CLAHE leve)
+        # Isso escurece o que é texto e clareia o fundo, sem transformar em blocos pretos
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
         contrast = clahe.apply(gray)
         
-        # 3. Suavização muito leve para remover ruído JPEG antes da binarização
-        blur = cv2.GaussianBlur(contrast, (3, 3), 0)
+        # 3. Sharpening (Filtro de nitidez)
+        # Realça as bordas das letras que estão borradas ou em baixa resolução
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(contrast, -1, kernel)
         
-        # 4. Binarização adaptativa: transforma a imagem estritamente em Preto(texto) e Branco(fundo)
-        # Essencial para apagar manchas de sombra na foto ou texturas de mesa
-        binary = cv2.adaptiveThreshold(
-            blur, 255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            11, 2
-        )
-        
-        # Converte de volta para 3 canais (RGB) porque o PaddleOCR espera esse formato na entrada
-        final_img = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+        # Converte de volta para 3 canais (RGB) porque o PaddleOCR espera esse formato
+        final_img = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
         return final_img
     except Exception as e:
         print(f"Erro no pré-processamento: {e}")
-        return img_array # Em caso de erro com alguma imagem maluca, devolve a original
+        return img_array
 
 def process_image(img_array, model_type="mobile", apply_preprocess=True):
     """
@@ -178,7 +173,7 @@ async def ocr_base64(payload: ImagePayload):
 async def ocr_file(
     file: UploadFile = File(...), 
     model: str = Query(..., description="Obrigatório: Escolha 'mobile' ou 'server'"),
-    preprocess: bool = Query(False, description="Opcional: Ativar pré-processamento de imagem")
+    preprocess: str = Query("false", description="Opcional: 'true' ou 'false'")
 ):
     try:
         contents = await file.read()
@@ -187,8 +182,11 @@ async def ocr_file(
         
         if img_cv2 is None:
              raise ValueError("Falha ao processar arquivo.")
+             
+        # Converte string explícita para boolean
+        do_preprocess = preprocess.lower() == "true"
 
-        data, full_text_str, proc_time, used = process_image(img_cv2, model, preprocess)
+        data, full_text_str, proc_time, used = process_image(img_cv2, model, do_preprocess)
         
         return OCRResponse(
             success=True, 
