@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  paddleocr:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 3G
+    ports:
+      - "8868:8868"
+    restart: unless-stopped
