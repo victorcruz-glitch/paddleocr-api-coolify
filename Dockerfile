@@ -13,9 +13,9 @@ RUN apt-get update && apt-get install -y \
 # Cria diretório de trabalho
 WORKDIR /app
 
-# Instala o PaddlePaddle versão CPU (leve) e o PaddleOCR
-RUN pip install --no-cache-dir paddlepaddle==2.6.2
-RUN pip install --no-cache-dir "paddleocr==2.8.1"
+# Instala a stack atual do PaddleOCR 3.x com PP-OCRv5 real
+RUN pip install --no-cache-dir paddlepaddle==3.2.2
+RUN pip install --no-cache-dir "paddleocr==3.4.0"
 
 # Instala FastAPI e Uvicorn para o servidor REST
 RUN pip install --no-cache-dir fastapi uvicorn python-multipart pydantic numpy
